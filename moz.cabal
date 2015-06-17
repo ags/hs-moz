@@ -26,6 +26,7 @@ library
                        , cryptohash
                        , http-conduit
                        , http-types
+                       , mtl
                        , time
   extensions:         OverloadedStrings
 
@@ -38,4 +39,5 @@ test-suite tests
   build-depends:       base
                        , moz
                        , hspec
+                       , mtl
                        , time

@@ -16,7 +16,10 @@ import Moz.Linkscape.URLMetrics (URLMetricCol(..))
 import qualified Moz.Linkscape as LS
 
 main :: IO ()
-main = LS.urlMetrics auth "moz.com" cols >>= print
+main = do
+  metrics <- LS.runMozT auth $ do
+    LS.urlMetrics "moz.com" testCols
+  print metrics
   where auth = Auth "access-id-123" "secret-key-456"
         cols = [ CanoncialURL
                , DomainAuthority

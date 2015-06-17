@@ -1,9 +1,15 @@
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+
 module Moz.Client
-  ( Error
+  ( MozError
+  , MozT(..)
   , mozGet
+  , runMozT
   ) where
 
-import Control.Arrow (left)
+import Control.Monad.Reader
+import Control.Monad.Except
+
 import Data.Aeson (FromJSON(..), eitherDecode)
 import Data.List (intercalate)
 import Data.Time.Clock (getCurrentTime)
@@ -12,7 +18,6 @@ import Network.HTTP.Types
 import Network.HTTP.Conduit
 
 import qualified Control.Exception as E
-import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy.Char8 as LBS
 
 import Moz.Auth (Auth(..), expires, signature)
@@ -21,42 +26,52 @@ type MozQueryParam = SimpleQueryItem
 
 type URL = String
 
-data Error = HTTPConnectionError E.SomeException
-           | JSONError String
-           deriving (Show)
+data MozError = HTTPConnectionError E.SomeException
+              | InvalidRequest
+              | JSONError String
+              deriving (Show)
 
-buildQueryString :: [MozQueryParam] -> BS.ByteString
-buildQueryString params = renderSimpleQuery True params
+newtype MozT m a = MozT { unMozT :: ExceptT MozError (ReaderT Auth m) a }
+  deriving ( Functor
+           , Applicative
+           , Monad
+           , MonadIO
+           , MonadReader Auth
+           , MonadError MozError
+           )
+
+runMozT :: MonadIO m => Auth -> MozT m a -> m (Either MozError a)
+runMozT auth m = runReaderT (runExceptT (unMozT m)) auth
 
 buildUrl :: [String] -> URL
 buildUrl paths = "http://lsapi.seomoz.com/" ++ intercalate "/" paths
 
-makeRequest :: Method -> URL -> [MozQueryParam] -> IO (Either Error (Response LBS.ByteString))
-makeRequest reqMethod url params = do
-  request' <- parseUrl url
-  let request = request' { method = reqMethod
-                         , queryString = buildQueryString params
-                         }
-  ((withManager $ httpLbs request) >>= return . Right) `E.catch`
-    (return . Left . HTTPConnectionError)
+prepReq :: Method -> URL -> [MozQueryParam] -> Maybe Request
+prepReq m url params = fmap (setM . setQS) (parseUrl url)
+  where setM r = r { method = m }
+        setQS r = r { queryString = renderSimpleQuery True params }
 
-authParams :: Auth -> IO [MozQueryParam]
-authParams auth = do
-  now <- getCurrentTime
+makeRequest :: (MonadIO m) => Request -> MozT m (Response LBS.ByteString)
+makeRequest req = do
+  rsp <- liftIO (((withManager $ httpLbs req) >>= return . Right) `E.catch` (return . Left))
+  either (throwError . HTTPConnectionError) return rsp
+
+authParams :: MonadIO m => MozT m [MozQueryParam]
+authParams = do
+  auth <- ask
+  now <- liftIO $ getCurrentTime
   return [ ("AccessID", accessId auth)
          , ("Expires", expires now)
          , ("Signature", signature auth now)
          ]
 
-decodeResponse :: (FromJSON a) => LBS.ByteString -> Either Error a
-decodeResponse json = left JSONError (eitherDecode json)
+mozAPI :: (FromJSON a, MonadIO m) => Method -> URL -> [MozQueryParam] -> MozT m a
+mozAPI reqMethod url queryParams = do
+  authP <- authParams
+  req <- maybe (throwError InvalidRequest) return (prepReq reqMethod url (queryParams ++ authP))
+  response <- makeRequest req
+  either (throwError . JSONError) return (eitherDecode (responseBody response))
 
-mozAPI :: (FromJSON a) => Auth -> Method -> URL -> [MozQueryParam] -> IO (Either Error a)
-mozAPI auth reqMethod url queryParams = do
-  aps <- authParams auth
-  response <- makeRequest reqMethod url (queryParams ++ aps)
-  return $ response >>= (decodeResponse . responseBody)
-
-mozGet :: (FromJSON a) => Auth -> [String] -> [MozQueryParam] -> IO (Either Error a)
-mozGet auth paths queryParams = mozAPI auth methodGet url queryParams
+mozGet :: (FromJSON a, MonadIO m) => [String] -> [MozQueryParam] -> MozT m a
+mozGet paths queryParams = mozAPI methodGet url queryParams
   where url = buildUrl paths
